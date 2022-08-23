@@ -1,3 +1,19 @@
+# Stable Diffusion Docker Service
+
+The running environment of Stable Diffusion
+
+`docker pull lxj616/stable-diffusion-docker-service`
+
+Please be noted that this docker image does not contain specific stable diffusion model weights, you need to inject to container using -v flag as below
+
+Interactive manual run:
+
+`docker run --gpus all -v /root/dev/dev_new/stable-diffusion/models/ldm/stable-diffusion-v1:/workdir/stable-diffusion/models/ldm/stable-diffusion-v1 -it lxj616/stable-diffusion-docker-service /bin/bash`
+
+As a service:
+
+See the example repo of stable-diffusion-qqbot for redis env file settings
+
 # Stable Diffusion
 *Stable Diffusion was made possible thanks to a collaboration with [Stability AI](https://stability.ai/) and [Runway](https://runwayml.com/) and builds upon our previous work:*
 
