@@ -21,6 +21,24 @@ from ldm.models.diffusion.plms import PLMSSampler
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 
+import redis
+import json
+
+REDIS_HOST_ADDRESS = os.getenv('REDIS_HOST_ADDRESS')
+REDIS_HOST_PORT = int(os.getenv('REDIS_HOST_PORT'))
+REDIS_DB_NUMBER = int(os.getenv('REDIS_DB_NUMBER'))
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
+REDIS_JOB_QUEUE_NAME = os.getenv('REDIS_JOB_QUEUE_NAME')
+REDIS_RESULT_QUEUE_NAME = os.getenv('REDIS_RESULT_QUEUE_NAME')
+REDIS_ERROR_QUEUE_NAME = os.getenv('REDIS_ERROR_QUEUE_NAME')
+
+r = redis.Redis(host=REDIS_HOST_ADDRESS, port=REDIS_HOST_PORT, db=REDIS_DB_NUMBER, password=REDIS_PASSWORD) #connect to server
+
+#from PIL import Image
+from PIL.PngImagePlugin import Image, PngInfo
+from io import BytesIO
+
+PARAM_LIST = ['txt_str', 'scale', 'n_samples', 'n_iter', 'ddim_steps', 'ddim_eta']
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -93,6 +111,35 @@ def check_safety(x_image):
             x_checked_image[i] = load_replacement(x_checked_image[i])
     return x_checked_image, has_nsfw_concept
 
+def send_error_info(r, err_dict):
+    r.rpush(REDIS_ERROR_QUEUE_NAME, json.dumps(err_dict))
+
+def load_and_sanitize_job_dict(r):
+    packed = r.blpop([REDIS_JOB_QUEUE_NAME], 5)
+    if not packed:
+        return None
+    try:
+        job_dict = json.loads(packed[1])
+        for key in PARAM_LIST:
+            if key not in job_dict.keys():
+                send_error_info(r, {'err': 404, 'info': 'missing param: ' + key, 'orig_job_dict': job_dict})
+                return None
+        job_dict['scale'] = float(job_dict['scale'])
+        job_dict['n_samples'] = int(job_dict['n_samples'])
+        job_dict['n_iter'] = int(job_dict['n_iter'])
+        job_dict['ddim_steps'] = int(job_dict['ddim_steps'])
+        job_dict['ddim_eta'] = float(job_dict['ddim_eta'])
+    except Exception as e:
+        send_error_info(r, {'err': 404, 'info': 'can not parse json from queue: ' + str(e), 'orig_job_dict': {}})
+        return None
+    return job_dict
+
+def send_inference_results(r, img_pil, job_dict):
+    metadata = PngInfo()
+    metadata.add_text("job_dict_json:", json.dumps(job_dict))
+    with BytesIO() as output:
+        img_pil.save(output, format="PNG", pnginfo=metadata)
+        r.rpush(REDIS_RESULT_QUEUE_NAME, output.getvalue())
 
 def main():
     parser = argparse.ArgumentParser()
@@ -151,7 +198,7 @@ def main():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -181,7 +228,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
@@ -281,25 +328,26 @@ def main():
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
+                while True:
+                    job_dict = load_and_sanitize_job_dict(r)
+                    if not job_dict:
+                        continue
+                    tic = time.time()
+                    all_samples = list()
+                    for n in trange(job_dict['n_iter'], desc="Sampling"):
                         uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
+                        if job_dict['scale'] != 1.0:
+                            uc = model.get_learned_conditioning(job_dict['n_samples'] * [""])
+                        c = model.get_learned_conditioning(job_dict['n_samples'] * [job_dict['txt_str']])
                         shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                        samples_ddim, _ = sampler.sample(S=job_dict['ddim_steps'],
                                                          conditioning=c,
-                                                         batch_size=opt.n_samples,
+                                                         batch_size=job_dict['n_samples'],
                                                          shape=shape,
                                                          verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
+                                                         unconditional_guidance_scale=job_dict['scale'],
                                                          unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
+                                                         eta=job_dict['ddim_eta'],
                                                          x_T=start_code)
 
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
@@ -310,34 +358,10 @@ def main():
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
-
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
-
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
-
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
-
-                toc = time.time()
-
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+                        for x_sample in x_checked_image_torch:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            send_inference_results(r, Image.fromarray(x_sample.astype(np.uint8)), job_dict)
+                    toc = time.time()
 
 
 if __name__ == "__main__":
